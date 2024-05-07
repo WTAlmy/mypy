@@ -14,12 +14,10 @@ import binascii
 import os
 import time
 from abc import abstractmethod
-from typing import TYPE_CHECKING, Any, Iterable
+from typing import Iterable
 
-if TYPE_CHECKING:
-    # We avoid importing sqlite3 unless we are using it so we can mostly work
-    # on semi-broken pythons that are missing it.
-    import sqlite3
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 
 class MetadataStore:
@@ -63,7 +61,8 @@ class MetadataStore:
         """
 
     @abstractmethod
-    def list_all(self) -> Iterable[str]: ...
+    def list_all(self) -> Iterable[str]:
+        ...
 
 
 def random_string() -> str:
@@ -134,92 +133,82 @@ class FilesystemMetadataStore(MetadataStore):
                 yield os.path.join(dir, file)
 
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS files (
-    path TEXT UNIQUE NOT NULL,
-    mtime REAL,
-    data TEXT
-);
-CREATE INDEX IF NOT EXISTS path_idx on files(path);
-"""
-# No migrations yet
-MIGRATIONS: list[str] = []
-
-
-def connect_db(db_file: str) -> sqlite3.Connection:
-    import sqlite3.dbapi2
-
-    db = sqlite3.dbapi2.connect(db_file)
-    db.executescript(SCHEMA)
-    for migr in MIGRATIONS:
-        try:
-            db.executescript(migr)
-        except sqlite3.OperationalError:
-            pass
-    return db
+def connect_db(
+    host: str, port: int, dbname: str, user: str, password: str
+) -> psycopg2.extensions.connection:
+    """Connect to a PostgreSQL database."""
+    conn = psycopg2.connect(host=host, port=port, dbname=dbname, user=user, password=password)
+    conn.autocommit = True
+    return conn
 
 
 class SqliteMetadataStore(MetadataStore):
+    """A PostgreSQL backed implementation for metadata storage."""
+
     def __init__(self, cache_dir_prefix: str) -> None:
-        # We check startswith instead of equality because the version
-        # will have already been appended by the time the cache dir is
-        # passed here.
-        if cache_dir_prefix.startswith(os.devnull):
-            self.db = None
-            return
+        self.db = connect_db("127.0.0.1", 5432, "mydatabase", "test", "test")
+        self.initialize_schema()
 
-        os.makedirs(cache_dir_prefix, exist_ok=True)
-        self.db = connect_db(os.path.join(cache_dir_prefix, "cache.db"))
-
-    def _query(self, name: str, field: str) -> Any:
-        # Raises FileNotFound for consistency with the file system version
-        if not self.db:
-            raise FileNotFoundError()
-
-        cur = self.db.execute(f"SELECT {field} FROM files WHERE path = ?", (name,))
-        results = cur.fetchall()
-        if not results:
-            raise FileNotFoundError()
-        assert len(results) == 1
-        return results[0][0]
+    def initialize_schema(self):
+        """Initialize the database schema."""
+        with self.db.cursor() as cur:
+            cur.execute(
+                """
+            CREATE TABLE IF NOT EXISTS files (
+                path TEXT PRIMARY KEY NOT NULL,
+                mtime REAL NOT NULL,
+                data TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS path_idx ON files(path);
+            """
+            )
+        self.db.commit()
 
     def getmtime(self, name: str) -> float:
-        mtime = self._query(name, "mtime")
-        assert isinstance(mtime, float)
-        return mtime
+        """Get the modification time of a metadata entry."""
+        with self.db.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT mtime FROM files WHERE path = %s", (name,))
+            result = cur.fetchone()
+            if not result:
+                raise FileNotFoundError("No entry found for the specified name.")
+            return result["mtime"]
 
     def read(self, name: str) -> str:
-        data = self._query(name, "data")
-        assert isinstance(data, str)
-        return data
+        """Read the data of a metadata entry."""
+        with self.db.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT data FROM files WHERE path = %s", (name,))
+            result = cur.fetchone()
+            if not result:
+                raise FileNotFoundError("No entry found for the specified name.")
+            return result["data"]
 
     def write(self, name: str, data: str, mtime: float | None = None) -> bool:
-        import sqlite3
-
-        if not self.db:
-            return False
-        try:
-            if mtime is None:
-                mtime = time.time()
-            self.db.execute(
-                "INSERT OR REPLACE INTO files(path, mtime, data) VALUES(?, ?, ?)",
-                (name, mtime, data),
-            )
-        except sqlite3.OperationalError:
-            return False
-        return True
+        """Write a metadata entry."""
+        if mtime is None:
+            mtime = time.time()
+        with self.db.cursor() as cur:
+            try:
+                cur.execute(
+                    "INSERT INTO files (path, mtime, data) VALUES (%s, %s, %s) ON CONFLICT (path) DO UPDATE SET mtime = EXCLUDED.mtime, data = EXCLUDED.data",
+                    (name, mtime, data),
+                )
+            except psycopg2.Error:
+                return False
+            return True
 
     def remove(self, name: str) -> None:
-        if not self.db:
-            raise FileNotFoundError()
-
-        self.db.execute("DELETE FROM files WHERE path = ?", (name,))
+        """Remove a metadata entry."""
+        with self.db.cursor() as cur:
+            cur.execute("DELETE FROM files WHERE path = %s", (name,))
 
     def commit(self) -> None:
-        if self.db:
-            self.db.commit()
+        """Commit the transaction to the database."""
+        self.db.commit()
 
     def list_all(self) -> Iterable[str]:
-        if self.db:
-            for row in self.db.execute("SELECT path FROM files"):
-                yield row[0]
+        """List all metadata entries."""
+        with self.db.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT path FROM files")
+            for row in cur:
+                yield row["path"]
+
